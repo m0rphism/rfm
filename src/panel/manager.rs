@@ -843,15 +843,19 @@ impl PanelManager {
                             self.redraw_footer();
                         }
                         Command::Rename => {
-                            let input = self
-                                .center
-                                .panel()
-                                .selected_path()
-                                .and_then(|p| p.file_name())
-                                .and_then(|f| f.to_owned().into_string().ok())
-                                .unwrap_or_default();
-                            self.mode = Mode::Rename { input };
-                            self.redraw_footer();
+                            let paths = self.marked_or_selected();
+                            // Single File Renaming without leaving rfm
+                            if paths.len() == 1 {
+                                if let Some(file_name) = paths[0].file_name() {
+                                    let input = file_name.to_string_lossy().to_string();
+                                    self.mode = Mode::Rename { input };
+                                    self.redraw_footer();
+                                }
+                            }
+                            // Bulkrenaming by spawning an editor to edit the file list.
+                            else {
+                                bulkrename(self, paths)?;
+                            }
                         }
                         Command::Next => {
                             self.center.panel_mut().select_next_marked();
@@ -1064,4 +1068,63 @@ impl PanelManager {
         }
         Ok(false)
     }
+}
+
+fn bulkrename(mgr: &mut PanelManager, old_paths: Vec<PathBuf>) -> Result<()> {
+    // Write selected filenames to a temporary file.
+    let temp_path = std::env::temp_dir().join("rfm_bulkrename");
+    let old_names = old_paths
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&temp_path, old_names)?;
+
+    // Let the user edit the temporary file.
+    info!("Opening bulkrename file '{}'", temp_path.to_string_lossy());
+    mgr.center.freeze();
+    if let Err(e) = mgr.opener.open(temp_path.clone()) {
+        error!("Opening bulkrename file failed: {e}");
+        std::fs::remove_file(&temp_path)?; // TODO: handle error
+    } else {
+        // Check if there's a 1-to-1 correspondence between old and new file names.
+        let contents = std::fs::read_to_string(&temp_path)?;
+        let new_file_names: Vec<&str> = contents.trim_matches('\n').lines().collect();
+        if new_file_names.len() != old_paths.len() {
+            error!(
+                "Bulkrename file has {} lines, but {} files should be renamed.",
+                new_file_names.len(),
+                old_paths.len()
+            );
+            // TODO: reeddit with original file names added as comment.
+        } else {
+            // Check if any new file path exists already.
+            // TODO: allow swapping names of files by renaming to a intermediary file names first.
+            let new_paths: Vec<PathBuf> = old_paths
+                .iter()
+                .zip(&new_file_names)
+                .map(|(p, n)| p.with_file_name(n))
+                .collect();
+            let collisions: Vec<_> = new_paths.iter().filter(|p| p.exists()).collect();
+            if collisions.len() > 0 {
+                error!("Bulkrename wants to rename a path to an already existing path.");
+                // TODO: reeddit with additional information about colliding paths.
+            } else {
+                // Rename old path to new paths.
+                for (old_path, new_path) in old_paths.iter().zip(&new_paths) {
+                    info!(
+                        "Bulkrename path '{}' to '{}'",
+                        old_path.to_string_lossy(),
+                        new_path.to_string_lossy()
+                    );
+                    std::fs::rename(old_path, new_path)?;
+                }
+            }
+        }
+    }
+    std::fs::remove_file(temp_path)?;
+    mgr.center.unfreeze();
+    mgr.redraw_everything();
+
+    Ok(())
 }
